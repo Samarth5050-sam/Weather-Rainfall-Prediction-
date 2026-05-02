@@ -24,7 +24,7 @@ app = Flask(__name__)
 # ==============================
 # Constants
 # ==============================
-N_STEPS = 3  # Time series lookback window (e.g. use past 3 days)
+N_STEPS = 1  # Data is sparse, so we use a window of 1 (current day)
 
 # ==============================
 # LSTM Model (Regression)
@@ -126,7 +126,7 @@ def prepare_and_train(df):
     optimizer = optim.Adam(lstm_model.parameters(), lr=0.005)
 
     lstm_model.train()
-    for epoch in range(15): # 15 epochs
+    for epoch in range(50): # 50 epochs
         for batch_X, batch_y in loader:
             optimizer.zero_grad()
             outputs = lstm_model(batch_X)
@@ -373,7 +373,7 @@ PREDICT_HTML = STYLE + """
 <body>
   <div style="animation: fadeIn 0.6s ease-out;">
     <h1>📍 {{ location }}</h1>
-    <p style="opacity:0.8; font-size: 1.1rem; margin-bottom: 20px;">Forecast for: <strong>{{ date_label }}</strong></p>
+    <p style="opacity:0.8; font-size: 1.1rem; margin-bottom: 20px;">Forecast for Next Day (after: <strong>{{ date_label }}</strong>)</p>
   </div>
 
   <div class="card" style="animation-delay: 0.1s; border: 2px solid rgba(56, 189, 248, 0.5);">
@@ -500,7 +500,7 @@ def predict():
     while len(seq_raw) < N_STEPS:
         seq_raw = pd.concat([seq_raw.iloc[[0]], seq_raw], ignore_index=True)
 
-    # Prepare features
+    # Prepare features for the model
     drop_cols = [c for c in ["Date", "Date_obj", "Time", "RISK_MM", "RainTomorrow"] if c in seq_raw.columns]
     seq_features = seq_raw.drop(columns=drop_cols)
     
@@ -523,17 +523,20 @@ def predict():
     else:
         suggestion = "🌞 No significant rain expected. Have a great day!"
 
-    # Plot Basis of prediction (Recent trends)
+    # Plot Basis of prediction (Recent trends) - Use up to 7 previous data points for the graph
+    graph_start_idx = max(0, target_idx - 6)
+    graph_seq = loc_data.iloc[graph_start_idx : target_idx + 1].copy()
+    
     matplotlib.rcParams['text.color'] = 'white'
     matplotlib.rcParams['axes.labelcolor'] = 'white'
     matplotlib.rcParams['xtick.color'] = 'white'
     matplotlib.rcParams['ytick.color'] = 'white'
     fig_basis, ax_basis = plt.subplots(figsize=(7, 3.5))
-    dates_plot = seq_raw["Date"].tolist()
-    if "Rainfall" in seq_raw.columns:
-        ax_basis.plot(dates_plot, seq_raw["Rainfall"], marker='o', label='Historical Rainfall (mm)', color='#38bdf8', linewidth=2)
-    if "Humidity3pm" in seq_raw.columns:
-        ax_basis.plot(dates_plot, seq_raw["Humidity3pm"], marker='x', label='Humidity3pm (%)', color='#10b981', linewidth=2)
+    dates_plot = graph_seq["Date"].tolist()
+    if "Rainfall" in graph_seq.columns:
+        ax_basis.plot(dates_plot, graph_seq["Rainfall"], marker='o', label='Historical Rainfall (mm)', color='#38bdf8', linewidth=2)
+    if "Humidity3pm" in graph_seq.columns:
+        ax_basis.plot(dates_plot, graph_seq["Humidity3pm"], marker='x', label='Humidity3pm (%)', color='#10b981', linewidth=2)
     
     ax_basis.set_title("Time-Series Basis for Prediction")
     ax_basis.legend(loc="upper left", framealpha=0.2)
@@ -541,7 +544,7 @@ def predict():
     ax_basis.patch.set_alpha(0)
     basis_img = fig_to_base64(fig_basis)
 
-    # Summary
+    # Summary uses the model's sequence (which is what it actually saw)
     summary = {}
     if "Temp3pm" in seq_raw.columns: summary["Avg Temp 3PM"] = f"{seq_raw['Temp3pm'].mean():.1f} °C"
     if "Humidity3pm" in seq_raw.columns: summary["Avg Humidity 3PM"] = f"{seq_raw['Humidity3pm'].mean():.1f}%"
