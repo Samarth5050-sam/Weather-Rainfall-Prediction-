@@ -30,17 +30,14 @@ N_STEPS = 1  # Data is sparse, so we use a window of 1 (current day)
 # LSTM Model (Regression)
 # ==============================
 class WeatherLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=2):
+    def __init__(self, input_size, hidden_size=32, num_layers=1):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        # Regression outputs exactly 1 value (Rainfall in mm)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, 1)
         
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :]) # Take last sequence output
-        # Apply ReLU because rainfall cannot be negative
-        out = torch.relu(out)
+        out = self.fc(out[:, -1, :]) # Linear output
         return out
 
 class LSTMModelWrapper:
@@ -51,11 +48,11 @@ class LSTMModelWrapper:
 
     def predict(self, X_seq):
         self.model.eval()
-        # X_seq should be (batch, seq, features) numpy array
         X_t = torch.tensor(X_seq, dtype=torch.float32)
         with torch.no_grad():
             outputs = self.model(X_t)
-        return outputs.numpy().flatten()
+        # Clip to 0 here instead of ReLU in the model
+        return np.maximum(0, outputs.numpy().flatten())
 
 # ==============================
 # Helper: Train model
@@ -93,44 +90,32 @@ def prepare_and_train(df):
     y_target = df["RISK_MM"].values.astype(np.float32)
 
     # Create sequences
-    X_seqs = []
-    y_seqs = []
-    
-    # To keep track of raw df indices to construct sequences for evaluation
-    locations_arr = df['Location'].values
-    
-    for i in range(N_STEPS - 1, len(df)):
-        if locations_arr[i] == locations_arr[i - N_STEPS + 1]: # check if same location
-            X_seqs.append(scaled_features[i - N_STEPS + 1 : i + 1])
-            y_seqs.append(y_target[i])
-
-    if not X_seqs:
-        # Fallback if dataset is too small
-        X_seqs = np.array([scaled_features[i:i+1] for i in range(len(df))])
-        y_seqs = np.array(y_target)
-    else:
-        X_seqs = np.array(X_seqs)
-        y_seqs = np.array(y_seqs)
+    X_seqs = np.array([scaled_features[i:i+1] for i in range(len(df))])
+    y_seqs = np.array(y_target)
 
     X_train, X_test, y_train, y_test = train_test_split(X_seqs, y_seqs, test_size=0.2, random_state=42)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
     
     dataset = TensorDataset(X_train_t, y_train_t)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    loader = DataLoader(dataset, batch_size=16, shuffle=True)
 
     lstm_model = WeatherLSTM(input_size=X_train.shape[2])
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(lstm_model.parameters(), lr=0.005)
+    optimizer = optim.Adam(lstm_model.parameters(), lr=0.01)
+    
+    # Custom Weighted Loss: focus on days where it actually rains
+    def weighted_mse_loss(pred, target):
+        weights = torch.ones_like(target)
+        weights[target > 0.1] = 10.0 # 10x importance for actual rain
+        return (weights * (pred - target)**2).mean()
 
     lstm_model.train()
-    for epoch in range(50): # 50 epochs
+    for epoch in range(100): # 100 epochs
         for batch_X, batch_y in loader:
             optimizer.zero_grad()
             outputs = lstm_model(batch_X)
-            loss = criterion(outputs, batch_y)
+            loss = weighted_mse_loss(outputs, batch_y)
             loss.backward()
             optimizer.step()
 
@@ -369,20 +354,37 @@ PREDICT_HTML = STYLE + """
 <head>
   <meta charset="utf-8">
   <title>Prediction – {{ location }}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
   <div style="animation: fadeIn 0.6s ease-out;">
-    <h1>📍 {{ location }}</h1>
-    <p style="opacity:0.8; font-size: 1.1rem; margin-bottom: 20px;">Forecast for Next Day (after: <strong>{{ date_label }}</strong>)</p>
+    <div style="display: flex; justify-content: space-between; align-items: center; max-width: 700px; margin: 0 auto 20px;">
+        <div style="text-align: left;">
+            <h1 style="margin:0;">📍 {{ location }}</h1>
+            <p style="opacity:0.8; font-size: 1.1rem; margin:0;">Forecast for Next Day (after: <strong>{{ date_label }}</strong>)</p>
+        </div>
+        <button onclick="exportData()" class="btn" style="padding: 8px 16px; font-size: 0.9rem; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); box-shadow: none;">📥 Export Data</button>
+    </div>
   </div>
 
-  <div class="card" style="animation-delay: 0.1s; border: 2px solid rgba(56, 189, 248, 0.5);">
+  <div class="card" style="animation-delay: 0.1s; border: 2px solid rgba(56, 189, 248, 0.5); position: relative; overflow: hidden;">
     <h2 style="color: #38bdf8;">Proper Rainfall Prediction</h2>
-    <div style="text-align: center; margin: 30px 0;">
-      <span style="font-size: 3.5rem; font-weight: 700; color: #fff;">
+    <div style="text-align: center; margin: 20px 0;">
+      <span style="font-size: 4rem; font-weight: 700; color: #fff; display: block;">
         {{ "%.1f"|format(predicted_mm) }} <span style="font-size: 1.5rem; color:#94a3b8;">mm</span>
       </span>
-      <p style="font-size:1.2rem; margin-top:15px; color: #cbd5e1;">{{ suggestion }}</p>
+      
+      <div style="max-width: 400px; margin: 15px auto;">
+        <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #94a3b8; margin-bottom: 5px;">
+            <span>Intensity Gauge</span>
+            <span>{% if predicted_mm > 10 %}Severe{% elif predicted_mm > 5 %}Heavy{% elif predicted_mm > 1 %}Light{% else %}Dry{% endif %}</span>
+        </div>
+        <div style="height: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; overflow: hidden;">
+            <div style="width: {{ [predicted_mm * 5, 100]|min }}%; height: 100%; background: linear-gradient(90deg, #38bdf8, #2563eb); transition: width 1s ease-out;"></div>
+        </div>
+      </div>
+
+      <p style="font-size:1.2rem; margin-top:20px; color: #cbd5e1; font-weight: 600;">{{ suggestion }}</p>
       
       <div style="margin-top: 15px;">
         <span class="badge {% if predicted_mm > 1.0 %}badge-yes{% else %}badge-no{% endif %}">
@@ -393,15 +395,15 @@ PREDICT_HTML = STYLE + """
   </div>
 
   <div class="card" style="animation-delay: 0.2s">
-    <h2>Basis of Prediction: Time-Series Trends</h2>
-    <p style="font-size:0.9rem; color:#94a3b8; margin-top:-10px;">The LSTM model analysed these exact historical features over the preceding days to calculate the rainfall amount.</p>
-    <div style="text-align: center; background: rgba(0,0,0,0.2); border-radius: 12px; padding: 10px;">
-      <img src="data:image/png;base64,{{ basis_img }}" alt="Basis of prediction chart" style="width: 100%; max-width: 600px; box-shadow: none;">
+    <h2>📊 Interactive Time-Series Trends</h2>
+    <p style="font-size:0.9rem; color:#94a3b8; margin-top:-10px; margin-bottom: 20px;">Detailed analysis of the historical sequence window.</p>
+    <div style="height: 300px; width: 100%;">
+        <canvas id="trendsChart"></canvas>
     </div>
   </div>
 
   <div class="card" style="animation-delay: 0.3s">
-    <h2>Historical Weather Summary for this Window</h2>
+    <h2>Historical Weather Summary</h2>
     <div class="stat-grid">
       {% for k, v in summary.items() %}
       <div class="stat-box">
@@ -409,12 +411,102 @@ PREDICT_HTML = STYLE + """
         <strong>{{ v }}</strong>
       </div>
       {% endfor %}
+      <div class="stat-box">
+        <span>Model Architecture</span>
+        <strong>LSTM Regression</strong>
+      </div>
     </div>
   </div>
 
-  <a href="/" class="back" style="animation: fadeIn 1s ease-out forwards; animation-delay: 0.5s; opacity: 0;">
-    Back to Dashboard
-  </a>
+  <div style="max-width: 700px; margin: 20px auto; text-align: left;">
+      <a href="/" class="back" style="animation: fadeIn 1s ease-out forwards; animation-delay: 0.5s; opacity: 0;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 8px;"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        Back to Dashboard
+      </a>
+  </div>
+
+  <script>
+    // Initialize Chart.js
+    const ctx = document.getElementById('trendsChart').getContext('2d');
+    const chartData = {{ chart_data|tojson }};
+    
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: chartData.labels,
+            datasets: [
+                {
+                    label: 'Historical Rainfall (mm)',
+                    data: chartData.rainfall,
+                    borderColor: '#38bdf8',
+                    backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                    borderWidth: 3,
+                    tension: 0.4,
+                    fill: true,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Humidity (%)',
+                    data: chartData.humidity,
+                    borderColor: '#10b981',
+                    borderDash: [5, 5],
+                    borderWidth: 2,
+                    tension: 0.4,
+                    yAxisID: 'y1'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#e2e8f0', font: { family: 'Outfit' } } }
+            },
+            scales: {
+                x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                y: { 
+                    type: 'linear', display: true, position: 'left',
+                    title: { display: true, text: 'Rainfall (mm)', color: '#38bdf8' },
+                    ticks: { color: '#94a3b8' },
+                    grid: { color: 'rgba(255,255,255,0.05)' }
+                },
+                y1: {
+                    type: 'linear', display: true, position: 'right',
+                    title: { display: true, text: 'Humidity (%)', color: '#10b981' },
+                    ticks: { color: '#94a3b8' },
+                    grid: { drawOnChartArea: false }
+                }
+            }
+        }
+    });
+
+    function exportData() {
+        const data = {
+            location: "{{ location }}",
+            date: "{{ date_label }}",
+            prediction: {{ predicted_mm }},
+            suggestion: "{{ suggestion }}",
+            history: chartData
+        };
+        
+        fetch('/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        })
+        .then(response => response.blob())
+        .then(blob => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `forecast_{{ location }}_{{ date_label }}.json`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+        });
+    }
+  </script>
 </body>
 </html>
 """
@@ -550,10 +642,24 @@ def predict():
     if "Humidity3pm" in seq_raw.columns: summary["Avg Humidity 3PM"] = f"{seq_raw['Humidity3pm'].mean():.1f}%"
     if "Pressure3pm" in seq_raw.columns: summary["Avg Pressure"] = f"{seq_raw['Pressure3pm'].mean():.1f} hPa"
 
+    # Prepare data for Interactive JS Chart (Chart.js)
+    chart_data = {
+        "labels": graph_seq["Date"].tolist(),
+        "rainfall": graph_seq["Rainfall"].tolist() if "Rainfall" in graph_seq.columns else [],
+        "humidity": graph_seq["Humidity3pm"].tolist() if "Humidity3pm" in graph_seq.columns else []
+    }
+
     return render_template_string(
         PREDICT_HTML, location=loc, date_label=date_label, predicted_mm=predicted_mm, 
-        suggestion=suggestion, basis_img=basis_img, summary=summary
+        suggestion=suggestion, basis_img=basis_img, summary=summary,
+        chart_data=chart_data
     )
+
+@app.route("/export", methods=["POST"])
+def export_data():
+    import json
+    data = request.json
+    return json.dumps(data, indent=4), 200, {'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename=prediction.json'}
 
 @app.route("/metrics")
 def metrics():
@@ -571,6 +677,7 @@ def map_view():
 
 @app.route("/mapframe")
 def map_frame():
+    from folium.plugins import HeatMap
     city_coords = {"Delhi":[28.7041,77.1025], "Mumbai":[19.0760,72.8777], "Bengaluru":[12.9716,77.5946],
                    "Chennai":[13.0827,80.2707], "Kolkata":[22.5726,88.3639], "Hyderabad":[17.3850,78.4867],
                    "Pune":[18.5204,73.8567], "Jaipur":[26.9124,75.7873], "Ahmedabad":[23.0225,72.5714],
@@ -580,15 +687,62 @@ def map_frame():
                    "Shimla":[31.1048,77.1734], "Patna":[25.5941,85.1376]}
     try:
         df_raw = STATE["df_raw"]
-        agg = df_raw.groupby("Location")["Rainfall"].mean().reset_index() if "Rainfall" in df_raw.columns else pd.DataFrame(columns=["Location", "Rainfall"])
+        model = STATE["model"]
         m = folium.Map(location=[22.0, 78.0], zoom_start=5, tiles="CartoDB dark_matter")
-        for _, row in agg.iterrows():
-            coords = city_coords.get(row["Location"])
-            if coords:
-                folium.CircleMarker(location=coords, radius=max(5, min(row["Rainfall"] / 2, 35)),
-                                    popup=f"<b>{row['Location']}</b><br>Avg Rainfall: {row['Rainfall']:.2f} mm",
-                                    color="#38bdf8", fill=True, fill_color="#0ea5e9", fill_opacity=0.7).add_to(m)
-    except:
+        
+        heat_data = []
+        for loc in STATE["unique_locations"]:
+            coords = city_coords.get(loc)
+            if not coords: continue
+            
+            # Get latest data for this location to predict
+            loc_data = df_raw[df_raw["Location"] == loc].sort_values(by="Date_obj")
+            if loc_data.empty: continue
+            
+            latest_row = loc_data.iloc[-1:]
+            
+            # Prepare features for prediction
+            drop_cols = [c for c in ["Date", "Date_obj", "Time", "RISK_MM", "RainTomorrow"] if c in latest_row.columns]
+            feat = latest_row.drop(columns=drop_cols)
+            for c, le in STATE["encoders"].items():
+                if c in feat.columns:
+                    feat[c] = le.transform(feat[c].astype(str))
+            
+            # Predict
+            scaled = model.scaler.transform(feat)
+            pred_mm = float(model.predict(np.array([scaled]))[0])
+            
+            # Color based on prediction
+            color = "#ef4444" if pred_mm > 5 else "#38bdf8"
+            
+            heat_data.append([coords[0], coords[1], pred_mm])
+            folium.CircleMarker(
+                location=coords, radius=7,
+                popup=f"<b>{loc}</b><br>Latest Date: {latest_row['Date'].values[0]}<br><span style='color:{color}; font-weight:bold;'>Forecast: {pred_mm:.2f} mm</span>",
+                color=color, fill=True, fill_color=color, fill_opacity=0.7
+            ).add_to(m)
+        
+        if heat_data:
+            HeatMap(heat_data, radius=25, blur=15, gradient={0.4: 'blue', 0.65: 'lime', 1: 'red'}).add_to(m)
+        
+        # Add a custom HTML Legend
+        legend_html = '''
+             <div style="position: fixed; 
+                         bottom: 50px; left: 50px; width: 180px; height: 120px; 
+                         background-color: rgba(15, 23, 42, 0.9); z-index:9999; font-size:14px;
+                         color: white; padding: 10px; border-radius: 10px;
+                         border: 1px solid rgba(255,255,255,0.2); backdrop-filter: blur(5px);">
+             <b style="color: #38bdf8;">Forecast Legend</b><br>
+             <i style="background:red; width:10px; height:10px; display:inline-block; border-radius:50%;"></i> Severe (>10mm)<br>
+             <i style="background:orange; width:10px; height:10px; display:inline-block; border-radius:50%;"></i> Heavy (>5mm)<br>
+             <i style="background:lime; width:10px; height:10px; display:inline-block; border-radius:50%;"></i> Light (>1mm)<br>
+             <i style="background:blue; width:10px; height:10px; display:inline-block; border-radius:50%;"></i> Dry (0-1mm)
+             </div>
+             '''
+        m.get_root().html.add_child(folium.Element(legend_html))
+            
+    except Exception as e:
+        print(f"Map error: {e}")
         m = folium.Map(location=[22.0, 78.0], zoom_start=5)
     return m._repr_html_()
 
