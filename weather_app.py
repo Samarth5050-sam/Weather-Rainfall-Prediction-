@@ -158,14 +158,26 @@ def prepare_and_train(df):
 STATE = {"trained": False}
 DEFAULT_CSV = os.environ.get("DEFAULT_CSV", "weather_sep_oct_2026.csv")
 
-try:
-    df_default = pd.read_csv(DEFAULT_CSV)
-    STATE.update(prepare_and_train(df_default))
-    STATE["trained"] = True
-    print(f"[OK] Time-Series LSTM Model trained on {len(df_default)} rows from '{DEFAULT_CSV}'")
-except Exception as exc:
-    print(f"[WARN] Could not train on '{DEFAULT_CSV}': {exc}")
-    STATE["trained"] = False
+import dill
+STATE_FILE = "weather_state.pkl"
+
+if os.path.exists(STATE_FILE):
+    try:
+        with open(STATE_FILE, "rb") as f:
+            STATE = dill.load(f)
+        print(f"[OK] Pre-trained state loaded directly from {STATE_FILE}! Bypassing boot training.")
+    except Exception as e:
+        print(f"[ERROR] Could not load state from {STATE_FILE}: {e}")
+        STATE = {"trained": False}
+else:
+    try:
+        df_default = pd.read_csv(DEFAULT_CSV)
+        STATE.update(prepare_and_train(df_default))
+        STATE["trained"] = True
+        print(f"[OK] Time-Series LSTM Model trained on {len(df_default)} rows from '{DEFAULT_CSV}'")
+    except Exception as exc:
+        print(f"[WARN] Could not train on '{DEFAULT_CSV}': {exc}")
+        STATE["trained"] = False
 
 def fig_to_base64(fig):
     buf = io.BytesIO()
