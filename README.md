@@ -49,10 +49,10 @@ http://localhost:8050/
 
 ## 🧠 Model Pipeline Overview
 
-1. **Data Ingestion**: The app actively scans and cleans the target dataset (`weather_sep_oct_2026.csv`), dropping any broken rows or corrupted NaN sequences.
-2. **Sequential Windowing**: It isolates unique locations, sorts them strictly by date, and builds `(Sequence_Length=3)` batches. 
-3. **Training & Regularization**: Fed into an optimized dual-layer PyTorch LSTM with a `dropout` regularization of 0.2. Loss is calculated using `nn.MSELoss()`.
-4. **Metrics Tracking**: Evaluates model performance post-training generating custom `Root Mean Square Error (RMSE)` and `Mean Absolute Error (MAE)` scores dynamically.
+1. **Data Ingestion**: The app loads and cleans the target dataset (`weather_sep_oct_2026.csv`), dropping any rows with missing values.
+2. **Feature Engineering**: Encodes categorical columns (Location, WindDir, RainToday) using `LabelEncoder` and normalizes all 21 features with `StandardScaler`.
+3. **Training & Optimization**: Fed into a single-layer PyTorch LSTM (32 hidden units) with a **Weighted MSE Loss** (10x importance on rainy days) for 100 epochs.
+4. **Metrics Tracking**: Evaluates performance with `RMSE`, `MAE`, and `R²` on a 20% held-out test set.
 
 ---
 *Built by Samarth.*
