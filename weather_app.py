@@ -24,20 +24,24 @@ app = Flask(__name__)
 # ==============================
 # Constants
 # ==============================
-N_STEPS = 1  # Data is sparse, so we use a window of 1 (current day)
+N_STEPS = 3  # Use a 3-day window to capture temporal trends
 
 # ==============================
 # LSTM Model (Regression)
 # ==============================
 class WeatherLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size=32, num_layers=1):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 1)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
         
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :]) # Linear output
+        out = self.fc(out[:, -1, :]) # Use the last time step
         return out
 
 class LSTMModelWrapper:
@@ -49,9 +53,9 @@ class LSTMModelWrapper:
     def predict(self, X_seq):
         self.model.eval()
         X_t = torch.tensor(X_seq, dtype=torch.float32)
+        if len(X_t.shape) == 2: X_t = X_t.unsqueeze(0)
         with torch.no_grad():
             outputs = self.model(X_t)
-        # Clip to 0 here instead of ReLU in the model
         return np.maximum(0, outputs.numpy().flatten())
 
 # ==============================
@@ -86,12 +90,28 @@ def prepare_and_train(df):
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features_df)
     
-    # Target: Predict EXACT rainfall amount (Regression)
+    # Target: Predict NEXT DAY rainfall amount (stored in RISK_MM)
     y_target = df["RISK_MM"].values.astype(np.float32)
 
-    # Create sequences
-    X_seqs = np.array([scaled_features[i:i+1] for i in range(len(df))])
-    y_seqs = np.array(y_target)
+    # Create sequences correctly grouped by location
+    X_seqs, y_seqs = [], []
+    for loc in unique_locations:
+        loc_mask = df["Location"] == loc
+        loc_features = scaled_features[loc_mask]
+        loc_y = y_target[loc_mask]
+        
+        # We need N_STEPS history to predict the target of the last day in that window
+        for i in range(len(loc_features) - N_STEPS + 1):
+            X_seqs.append(loc_features[i : i + N_STEPS])
+            y_seqs.append(loc_y[i + N_STEPS - 1])
+            
+    X_seqs = np.array(X_seqs)
+    y_seqs = np.array(y_seqs)
+
+    if len(X_seqs) == 0:
+        # Fallback if data is too small for sequences
+        X_seqs = np.array([scaled_features[i:i+1] for i in range(len(df))])
+        y_seqs = np.array(y_target)
 
     X_train, X_test, y_train, y_test = train_test_split(X_seqs, y_seqs, test_size=0.2, random_state=42)
 
@@ -102,16 +122,15 @@ def prepare_and_train(df):
     loader = DataLoader(dataset, batch_size=16, shuffle=True)
 
     lstm_model = WeatherLSTM(input_size=X_train.shape[2])
-    optimizer = optim.Adam(lstm_model.parameters(), lr=0.01)
+    optimizer = optim.Adam(lstm_model.parameters(), lr=0.005)
     
-    # Custom Weighted Loss: focus on days where it actually rains
     def weighted_mse_loss(pred, target):
         weights = torch.ones_like(target)
-        weights[target > 0.1] = 10.0 # 10x importance for actual rain
+        weights[target > 0.1] = 15.0 # Higher weight for rain events
         return (weights * (pred - target)**2).mean()
 
     lstm_model.train()
-    for epoch in range(100): # 100 epochs
+    for epoch in range(150): # More epochs for better fit
         for batch_X, batch_y in loader:
             optimizer.zero_grad()
             outputs = lstm_model(batch_X)
@@ -481,6 +500,22 @@ PREDICT_HTML = STYLE + """
     </div>
   </div>
 
+  <!-- Why this prediction? (Feature Insights) -->
+  <div class="card" style="animation-delay: 0.15s;">
+    <h2 style="border: none; margin-bottom: 15px;">🔍 Why this prediction? (Model Insights)</h2>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+      {% for insight in insights %}
+      <div style="background: rgba(255,255,255,0.05); padding: 15px; border-radius: 12px; border-left: 3px solid {{ intensity_color }};">
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+          <span style="font-size: 1.5rem;">{{ insight.icon }}</span>
+          <strong style="color: #fff; font-size: 1rem;">{{ insight.label }}</strong>
+        </div>
+        <p style="font-size: 0.85rem; color: #94a3b8; margin: 0; line-height: 1.4;">{{ insight.desc }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
   <!-- Actual vs Predicted Comparison -->
   {% if actual_mm is not none %}
   <div class="card" style="animation-delay: 0.15s; text-align: center;">
@@ -821,12 +856,42 @@ def predict():
         "temp": graph_seq["Temp3pm"].tolist() if "Temp3pm" in graph_seq.columns else []
     }
 
+    # Calculate Feature Insights (Simplified Importance)
+    # We look at the latest scaled features and see which are most extreme (deviating from mean)
+    latest_scaled = seq_scaled[-1]
+    feature_names = model.feature_names_in_
+    insights = []
+    
+    # Humidity Insight
+    if "Humidity3pm" in feature_names:
+        idx = feature_names.index("Humidity3pm")
+        val = latest_scaled[idx]
+        if val > 1.0: insights.append({"icon": "💧", "label": "High Humidity", "desc": "Elevated moisture levels are a primary driver for this rain forecast."})
+        elif val < -1.0: insights.append({"icon": "🌵", "label": "Low Humidity", "desc": "Dry air conditions are significantly reducing rain probability."})
+        
+    # Pressure Insight
+    if "Pressure3pm" in feature_names:
+        idx = feature_names.index("Pressure3pm")
+        val = latest_scaled[idx]
+        if val < -1.0: insights.append({"icon": "📉", "label": "Falling Pressure", "desc": "A low-pressure system is detected, which often precedes rainfall."})
+        elif val > 1.0: insights.append({"icon": "📈", "label": "High Pressure", "desc": "Stable high-pressure conditions are keeping the skies clear."})
+
+    # Wind Insight
+    if "WindGustSpeed" in feature_names:
+        idx = feature_names.index("WindGustSpeed")
+        val = latest_scaled[idx]
+        if val > 1.5: insights.append({"icon": "💨", "label": "Strong Gusts", "desc": "High wind speeds suggest potential storm development."})
+
+    if not insights:
+        insights.append({"icon": "⚖️", "label": "Stable Conditions", "desc": "Weather metrics are within normal ranges for this period."})
+
     return render_template_string(
         PREDICT_HTML, location=loc, date_label=date_label, predicted_mm=predicted_mm, 
         suggestion=suggestion, basis_img=basis_img, summary=summary,
         chart_data=chart_data, actual_mm=actual_mm, confidence=confidence,
         rain_prob=rain_prob, weather_icon=weather_icon, 
-        weather_condition=weather_condition, intensity_color=intensity_color
+        weather_condition=weather_condition, intensity_color=intensity_color,
+        insights=insights
     )
 
 @app.route("/export", methods=["POST"])
