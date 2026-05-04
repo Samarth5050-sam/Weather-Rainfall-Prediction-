@@ -143,14 +143,36 @@ def prepare_and_train(df):
 STATE = {"trained": False}
 DEFAULT_CSV = os.environ.get("DEFAULT_CSV", "weather_sep_oct_2026.csv")
 
-import dill
+import pickle
 STATE_FILE = "weather_state.pkl"
 
 if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, "rb") as f:
-            STATE = dill.load(f)
-        print(f"[OK] Pre-trained state loaded directly from {STATE_FILE}! Bypassing boot training.")
+            saved = pickle.load(f)
+        
+        # Reconstruct the LSTM model from saved state_dict
+        config = saved["model_config"]
+        lstm_model = WeatherLSTM(
+            input_size=config["input_size"],
+            hidden_size=config["hidden_size"],
+            num_layers=config["num_layers"]
+        )
+        lstm_model.load_state_dict(saved["model_state_dict"])
+        lstm_model.eval()
+        
+        wrapper = LSTMModelWrapper(lstm_model, saved["scaler"], saved["feature_names"])
+        
+        STATE = {
+            "trained": True,
+            "model": wrapper,
+            "df_raw": saved["df_raw"],
+            "encoders": saved["encoders"],
+            "metrics": saved["metrics"],
+            "unique_locations": saved["unique_locations"],
+            "unique_dates": saved["unique_dates"],
+        }
+        print(f"[OK] Pre-trained state loaded from {STATE_FILE}! Bypassing boot training.")
     except Exception as e:
         print(f"[ERROR] Could not load state from {STATE_FILE}: {e}")
         STATE = {"trained": False}
