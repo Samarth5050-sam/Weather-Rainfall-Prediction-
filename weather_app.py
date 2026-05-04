@@ -151,14 +151,20 @@ if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "rb") as f:
             saved = pickle.load(f)
         
-        # Reconstruct the LSTM model from saved state_dict
+        # Reconstruct the LSTM model from saved weights
         config = saved["model_config"]
         lstm_model = WeatherLSTM(
             input_size=config["input_size"],
             hidden_size=config["hidden_size"],
             num_layers=config["num_layers"]
         )
-        lstm_model.load_state_dict(saved["model_state_dict"])
+        
+        # Load weights (stored as numpy arrays, convert back to torch tensors)
+        weights = saved.get("model_weights") or saved.get("model_state_dict")
+        state_dict = {}
+        for key, val in weights.items():
+            state_dict[key] = torch.tensor(val) if not isinstance(val, torch.Tensor) else val
+        lstm_model.load_state_dict(state_dict)
         lstm_model.eval()
         
         wrapper = LSTMModelWrapper(lstm_model, saved["scaler"], saved["feature_names"])
